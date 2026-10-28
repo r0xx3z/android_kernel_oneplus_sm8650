@@ -1,0 +1,58 @@
+name: Build kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: Kernel source repository
+        default: https://github.com/DroidKitchen/android_kernel_oneplus_sm8650
+      branch:
+        description: Kernel branch
+        default: "17.0"
+      disable_lto:
+        description: Disable ThinLTO (less RAM, faster build)
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      WORKDIR: ${{ github.workspace }}/work
+      REPO_URL: ${{ inputs.repo_url }}
+      BRANCH: ${{ inputs.branch }}
+      DISABLE_LTO: ${{ inputs.disable_lto && '1' || '0' }}
+    steps:
+      - name: Checkout builder repo
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex cpio lz4 xz-utils rsync python3 curl \
+            libssl-dev libelf-dev dwarves
+
+      - name: Restore Clang cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/work/clang
+          key: clang-r487747c
+
+      - name: Build
+        run: bash build_kernel.sh all
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sm8650-kernel-${{ github.run_number }}
+          path: work/artifacts
+          retention-days: 14
+          if-no-files-found: error
+          
