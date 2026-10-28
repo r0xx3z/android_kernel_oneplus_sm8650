@@ -1,58 +1,138 @@
-name: Build kernel
-
+name: Start build
 on:
   workflow_dispatch:
     inputs:
-      repo_url:
-        description: Kernel source repository
-        default: https://github.com/DroidKitchen/android_kernel_oneplus_sm8650
-      branch:
-        description: Kernel branch
-        default: "17.0"
       disable_lto:
         description: Disable ThinLTO (less RAM, faster build)
         type: boolean
         default: false
 
 jobs:
-  build:
-    runs-on: ubuntu-24.04
+  Building:
+    runs-on: ubuntu-latest
     timeout-minutes: 360
+
     env:
-      WORKDIR: ${{ github.workspace }}/work
-      REPO_URL: ${{ inputs.repo_url }}
-      BRANCH: ${{ inputs.branch }}
-      DISABLE_LTO: ${{ inputs.disable_lto && '1' || '0' }}
+      ARCH: arm64
+      KBUILD_BUILD_USER: Llorens
+      KBUILD_BUILD_HOST: MKernel
+      # SM8650 = "pineapple": base GKI defconfig + SoC vendor fragment
+      DEFCONFIG: gki_defconfig
+      VENDOR_FRAGMENT: vendor/pineapple_GKI.config
+      # Common make arguments (LLVM=1 is enough for a 6.1 GKI kernel, no GCC needed)
+      MAKE_ARGS: O=out LLVM=1 LLVM_IAS=1
+      # AnyKernel3 template; set AK3_BRANCH if your repo has a branch for this device
+      AK3_REPO: https://github.com/osm0sis/AnyKernel3
+      AK3_BRANCH: ""
+
     steps:
-      - name: Checkout builder repo
-        uses: actions/checkout@v4
+    - name: 🔄 Checkout Code
+      uses: actions/checkout@v5
+      with:
+        # KernelSU-Next is a git submodule of this tree
+        submodules: recursive
 
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          df -h /
+    - name: 📦 Install Dependencies
+      run: |
+        sudo apt update -y
+        sudo apt install bc cpio flex bison aptitude git python-is-python3 tar aria2 perl wget curl lz4 libssl-dev libelf-dev dwarves rsync zstd -y
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            bc bison flex cpio lz4 xz-utils rsync python3 curl \
-            libssl-dev libelf-dev dwarves
+    - name: 🔧 Clone Toolchains
+      run: |
+        mkdir clang && cd clang
+        wget -q https://github.com/Neutron-Toolchains/clang-build-catalogue/releases/download/10032024/neutron-clang-10032024.tar.zst
+        tar --zstd -xf neutron-clang-10032024.tar.zst
+        cd ..
 
-      - name: Restore Clang cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/work/clang
-          key: clang-r487747c
+    - name: ⚙️ Setup Environment
+      run: |
+        echo "$GITHUB_WORKSPACE/clang/bin" >> $GITHUB_PATH
 
-      - name: Build
-        run: bash build_kernel.sh all
+    - name: 🩹 Check source tree
+      run: |
+        # OPLUS drivers are usually symlinks into vendor/oplus, outside of this repo.
+        # List the ones that do not resolve so the cause is visible in the log.
+        echo "Broken symlinks:"
+        find . -xtype l -not -path './.git/*' | head -n 50
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: sm8650-kernel-${{ github.run_number }}
-          path: work/artifacts
-          retention-days: 14
-          if-no-files-found: error
-          
+        # Comment out Kconfig "source" lines whose file does not exist,
+        # otherwise "make gki_defconfig" aborts with "can't open file".
+        python3 - <<'EOF'
+        import os, re
+
+        # Only literal paths; lines using $(VAR) are left untouched
+        pat = re.compile(r'^(\s*)source\s+"([^"$]+)"', re.M)
+
+        for root, dirs, files in os.walk('.'):
+            dirs[:] = [d for d in dirs if d not in ('.git', 'out')]
+            for name in files:
+                if not name.startswith('Kconfig'):
+                    continue
+                path = os.path.join(root, name)
+                with open(path, encoding='utf-8', errors='surrogateescape') as f:
+                    txt = f.read()
+
+                def fix(m):
+                    if os.path.exists(m.group(2)):
+                        return m.group(0)
+                    print(f'[CI] missing Kconfig source in {path}: {m.group(2)}')
+                    return f'{m.group(1)}# [CI] missing: {m.group(2)}'
+
+                new = pat.sub(fix, txt)
+                if new != txt:
+                    with open(path, 'w', encoding='utf-8', errors='surrogateescape') as f:
+                        f.write(new)
+        EOF
+
+    - name: 🛠️ Configure Kernel
+      env:
+        DISABLE_LTO: ${{ inputs.disable_lto }}
+      run: |
+        clang --version | head -n1
+        make $MAKE_ARGS $DEFCONFIG
+        make $MAKE_ARGS $VENDOR_FRAGMENT
+
+        # Without the Kleaf ABI symbol list, trimming exported symbols breaks the build
+        scripts/config --file out/.config -d TRIM_UNUSED_KSYMS
+        if [ "$DISABLE_LTO" = "true" ]; then
+          scripts/config --file out/.config -d LTO_CLANG_THIN -d LTO_CLANG_FULL -e LTO_NONE
+        fi
+        make $MAKE_ARGS olddefconfig
+
+    - name: 🛠️ Build Kernel
+      run: |
+        make -j$(nproc --all) $MAKE_ARGS Image modules
+        make $MAKE_ARGS modules_install INSTALL_MOD_PATH="$PWD/out/modules_staging" INSTALL_MOD_STRIP=1
+        # DTBs usually live in a separate devicetrees repo; do not fail the job for that
+        make -j$(nproc --all) $MAKE_ARGS dtbs || echo "::warning::dtbs target failed or is not provided by this tree"
+
+    - name: 📦 Pack raw outputs
+      run: |
+        mkdir raw
+        cp out/arch/arm64/boot/Image raw/Image
+        cp out/.config raw/config
+        tar -C out/modules_staging -czf raw/modules.tar.gz .
+
+    - name: 📂 Clone Anykernel3 & Zip
+      run: |
+        if [ -n "$AK3_BRANCH" ]; then
+          git clone --depth=1 -b "$AK3_BRANCH" "$AK3_REPO" AnyKernel3
+        else
+          git clone --depth=1 "$AK3_REPO" AnyKernel3
+        fi
+        cp out/arch/arm64/boot/Image AnyKernel3/Image
+        cd AnyKernel3
+        zip -r "../MKernel.zip" *
+
+    - name: 📤 Upload Raw outputs
+      uses: actions/upload-artifact@v5
+      with:
+        name: MKernel-raw
+        path: raw/*
+        if-no-files-found: error
+
+    - name: 📤 Upload Flashable zip
+      uses: actions/upload-artifact@v5
+      with:
+        name: MKernel
+        path: AnyKernel3/*
